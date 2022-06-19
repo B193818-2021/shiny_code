@@ -1,0 +1,577 @@
+---
+title: "liver-seq"
+author: "Shu Hu"
+date: "5/14/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r import packages}
+# load all the packages we need
+library(tximport)
+library(rtracklayer)
+library(edgeR)
+library(pheatmap)
+library(ggplot2)
+library(PCAtools)
+library(GSEABase)
+```
+
+```{r load data}
+# load all the raw data we need for differential expression gene anlaysis
+sample_detail<-read.csv("sample_data.csv",header=TRUE,row.names = 1)
+raw_gene<-read.csv("raw_gene.csv",header=TRUE,row.names = 1)
+counts<-read.csv("counts.csv",header = TRUE,row.names = 1)
+controls_ids<-read.table("control_ids.txt",header=T)
+```
+
+## DE analysis
+```{r}
+# Remove any rows from 'sample_info' not corresponding to samples present in 'counts'
+sample_detail<-sample_detail[rownames(sample_detail) %in% colnames(counts),]
+counts<-counts[,rownames(sample_detail)]
+```
+
+```{r}
+# build the DEGList object
+dgList_raw<- DGEList(
+  counts = counts, # counts data
+  samples = sample_detail, # sample data
+  group=sample_detail$nash.crn_kleiner_fibrosis_stage # specify experimental groups
+)
+```
+
+```{r}
+# calculate the normalisation factors
+dgList <- calcNormFactors(dgList_raw)
+
+# get the control sample
+controls<-rep("disease",length(dgList$samples[,1]))
+controls[which(row.names(dgList$samples) %in% controls_ids[,1])]<-"control"
+dgList$samples[['control']]<-controls
+```
+
+
+```{r}
+# plotMDS(
+#   dgList, 
+#   gene.selection = 'pairwise',
+#   col = as.integer(dgList$samples$saf_steatosis), 
+#   # specifics the sample attribute that will colour the points
+#   labels = dgList$samples$saf_steatosis 
+#   # specifics the sample attribute that will label the points
+# )
+```
+
+```{r}
+## Using filterByExpr() to filter genes by expression level
+dgList_unfilter<-dgList
+nrow(dgList_unfilter)
+keep<-filterByExpr(
+  dgList_unfilter, # DGEList object
+  min.count= 10,# minimum count per sample (default 10)
+  group=dgList_unfilter$sample$nash.crn_kleiner_fibrosis_stage, # factor showing how the samples are assigned to experimental groups. We #actually don't need to specify this as the main experimental group is called `group`.
+  min.total.count=15 # minimum number of reads across all samples (default 15)
+  ) 
+head(keep)
+```
+
+```{r}
+# get an impression of the coverage across samples
+hist(log2(rowSums(cpm(dgList_unfilter))))
+summary(log2(rowSums(cpm(dgList_unfilter))))
+# compared the unfiltered dgList and filtered dgList
+hist(log2(rowSums(cpm(dgList))))
+summary(log2(rowSums(cpm(dgList))))
+```
+
+```{r}
+# use the filter dgList to analysis
+dgList<-dgList_unfilter[keep,]
+nrow(dgList)
+dgList <- calcNormFactors(dgList)
+```
+
+```{r}
+# plot the pca
+counts_for_pca<-cpm(dgList$counts,log=TRUE,prior.count=1)
+pca_output <- pca(counts_for_pca, metadata = dgList$samples)
+biplot(pca_output,colby="nash.crn_kleiner_fibrosis_stage",pointSize = 0.5,x="PC1",y="PC2", lab = NULL)
+```
+
+```{r}
+biplot(pca_output,colby="nash.crn_kleiner_fibrosis_stage",pointSize = 0.5,x="PC2",y="PC3", lab = NULL)
+```
+
+
+```{r}
+# build the desgin matrix
+design <- model.matrix(~0 + group, data = dgList$samples)
+# Estimating disperation
+dgGlm <- estimateDisp(dgList, design, robust = TRUE)
+```
+
+```{r}
+# plot the BCV plot
+plotBCV(dgGlm)
+```
+
+```{r}
+# Fitting the data to the model
+fit <- glmQLFit(dgGlm, design, robust = TRUE)
+# testing for DE genes
+# change the colnames of the design matrix to make the contrast matrix
+# design_colname<-c("group_0","group_1","group_1.25","group_1.5","group_2","group_3","group_4","saf_steatosis.1","saf_steatosis.2","saf_steatosis.3")
+# colnames(design)<-design_colname
+contrast_name<-'group0-group4'
+contrast_matrix <- makeContrasts(contrasts=contrast_name,levels=design)
+```
+
+```{r}
+# get the DE results
+de <- glmQLFTest(fit, contrast=contrast_matrix)
+```
+
+```{r}
+# get the top genes of this contrast DE results
+top_genes<-topTags(de, n=20)
+top_genes
+```
+
+```{r}
+##individual gene differntial expresssion
+#define a function for plotting the individual gene differntial expresssion 
+plot_gene <- function(gene_id, inputDgList){
+  expr <- cpm(inputDgList) # calculate counts per million
+  plot_data <- cbind(inputDgList$samples, expression = expr[gene_id,]) # Add expression 
+ #data for the selected gene to a copy of the sample info
+  plot_data <- plot_data[order(plot_data$group),] # Order samples by experimental group
+# (assumes you have called your main experimental variable 'group')
+p <- ggplot(plot_data, aes(x=nash.crn_kleiner_fibrosis_stage, y=expression, fill=group)) + 
+    geom_bar(stat = 'identity') +  theme_bw() +
+    theme(axis.text.x = element_text(angle = 0, hjust = 0)) + 
+    xlab('fibrosis stage')+ ylab('CPM')+
+    ggtitle(gene_id)
+  print(p)
+}
+```
+
+```{r}
+# plot the individual top gene differntial expresssion
+plot_gene('ITGBL1', dgList)
+plot_gene(rownames(top_genes)[2], dgList)
+```
+
+```{r}
+# plot heatmap of the top genes
+plotmatrix<-cpm(dgList)[rownames(top_genes),]
+ pheatmap(
+    plotmatrix,  # matrix of counts
+    show_rownames = TRUE,
+    show_colnames = FALSE,
+    border_color = NA,
+    legend = FALSE,
+    cluster_cols = FALSE, # change to TRUE to get a dendrogram of samples
+    cluster_rows = TRUE,
+    scale = 'row',
+    color = colorRampPalette(rev(RColorBrewer::brewer.pal(n = 7, name = "RdYlBu")))(2)
+  )
+```
+
+```{r}
+# counts log transformed
+plotmatrix<-cpm(dgList,log = TRUE)[rownames(top_genes),]
+ pheatmap(
+    plotmatrix,  # matrix of counts
+    show_rownames = TRUE,
+    show_colnames = FALSE,
+    border_color = NA,
+    legend = FALSE,
+    cluster_cols = FALSE, # change to TRUE to get a dendrogram of samples
+    cluster_rows = TRUE,
+    scale = 'row',
+    color = colorRampPalette(rev(RColorBrewer::brewer.pal(n = 7, name = "RdYlBu")))(2)
+  )
+```
+
+```{r}
+# add the annotation column
+annotation_col<-dgList$samples[c('nash.crn_kleiner_fibrosis_stage','control','saf_steatosis')]
+colnames(annotation_col)<-c("fibrosis","control","steatosis")
+annotation_col
+```
+
+```{r}
+# plot the heatmap add the annotation column
+plotmatrix <- cpm(dgList,log=TRUE)[rownames(top_genes),]
+ pheatmap(
+    plotmatrix,  # matrix of counts
+    show_rownames = TRUE,
+    show_colnames = FALSE,
+    border_color = NA,
+    legend = FALSE, 
+    cluster_cols = FALSE,
+    cluster_rows = TRUE,
+    scale = 'row',
+    color = colorRampPalette(rev(RColorBrewer::brewer.pal(n = 7, name = "RdYlBu")))(2),
+    annotation_col = annotation_col
+  )
+```
+
+```{r}
+# define a function to plot heatmap
+plot_heatmap <- function(plot_genes, title='', inputDgList,sample_annotation = NA){ # Take out any genes not in the matrix
+  plot_genes <- plot_genes[plot_genes %in% rownames(inputDgList)]
+    # Make an expression matix by calculating cpm and pulling out the selected genes,
+  plotmatrix <- cpm(inputDgList,log=TRUE)[plot_genes,]
+  
+  if(!is.na(sample_annotation)){
+  # Create data frame with the information for labelling samples
+    annotation_col<-inputDgList$samples[sample_annotation]
+     # Order it according to the first sample variable specified
+    annotation_col<-annotation_col[order(annotation_col[[sample_annotation[1]]]),,drop=FALSE]
+    # Put columns in the same order as the rows in annotation_col
+     plotmatrix <-plotmatrix[,rownames(annotation_col)] 
+  }
+  #grid::grid.newpage()
+  
+  pheatmap(
+    plotmatrix,
+    show_rownames = TRUE,
+    show_colnames = FALSE,
+   annotation_col = annotation_col,
+    border_color = NA,
+    legend = TRUE,
+    cluster_cols = FALSE, # change to TRUE to get a dendrogram of samples
+    cluster_rows = TRUE,
+    scale = 'row',
+    color = colorRampPalette(rev(RColorBrewer::brewer.pal(n = 7, name = "RdYlBu")))(2),
+    main = title
+  )
+}
+```
+
+```{r}
+# get the DE genes 
+results <- topTags(de, n=nrow(dgList), sort.by='none')$table
+```
+
+```{r}
+# Filtering significant genes
+fdr_threshold <- 0.05
+fc_threshold <- 2
+diffexp_genes <- rownames(results)[abs(results$logFC) >= log2(fc_threshold) & results$FDR <= fdr_threshold ]
+print(paste(length(diffexp_genes), 'genes are differentially expressed at a fold change of at least',fc_threshold, 'and a maximum FDR of', fdr_threshold))
+```
+
+```{r}
+#MA plots
+plotMD(de, status = decideTestsDGE(de, p.value=0.05),cex=0.6,col=c("red","green","blue")) # 'cex' dictates the size of the points
+abline(h=c(-1,1),col='yellow') # add horizontal lines indicating a two fold change in expression
+```
+
+```{r}
+# define a function using ggplot2 to plot MA plots
+ma_plot<- function(results_table, fc_threshold, fdr_threshold){
+  results_table$significant <- 'no'
+  results_table$significant[results_table$FDR <= fdr_threshold  ] <- 'yes'
+ggplot(results_table, aes(logCPM, logFC,  color=significant )) + 
+    geom_point(alpha = 0.2) +     # This alters the transparency of the points
+    scale_colour_manual(name = 'significant',   # provides the label
+    values = setNames(c('red','grey'),c('yes', 'no'))) +
+    geom_hline(yintercept=log2(fc_threshold), linetype= "dashed") +
+    geom_hline(yintercept=-1*log2(fc_threshold), linetype= "dashed") +
+    theme_bw()
+}
+```
+
+```{r}
+ma_plot(results,2,0.05) 
+# The arguments are: results table, fold change threshold, FDR threshold
+```
+
+```{r}
+# volcano plots
+genes<-results
+# add a column of NAs
+genes$diffexpressed <- "NO"
+# can be change in shiny by users
+# if log2Foldchange > 0.6 and pvalue < 0.05, set as "UP" 
+genes$diffexpressed[genes$logFC > 0.6 & genes$PValue < 0.05] <- "UP"
+# if log2Foldchange < -0.6 and pvalue < 0.05, set as "DOWN"
+genes$diffexpressed[genes$logFC < -0.6 & genes$PValue < 0.05] <- "DOWN"
+ggplot(data=genes, aes(logFC, -log10(PValue))) +
+   geom_point(aes(col=diffexpressed),)+
+   geom_text_repel(aes(label=ifelse(abs(logFC)>=4, #change in shiny
+                                    as.character(row.names(genes)),'')))+
+   theme_classic()+
+   geom_vline(xintercept=c(0.6,-0.6), linetype = 'dashed')
+```
+
+```{r}
+volcano_plot<- function(results_table, fc_threshold=2, fdr_threshold=0.05,label_threshold=9){
+genes<-results
+genes$Significant<-ifelse(genes$FDR<=fdr_threshold, 'Yes', 'No') #adds a column in the `genes` table to show whether each gene is significantly expressed
+ggplot(data=genes, aes(logFC, -log10(FDR))) +  # the values for the x and y axis
+   geom_point(aes(col=Significant),size=0.2)+# shows how the points will look
+    geom_text_repel(aes(label=ifelse(abs(logFC)>=label_threshold,as.character(row.names(genes)),'')))+ # labels all genes with a log fold change greater than the speified threshold
+  scale_colour_manual(name = 'Significant', values = setNames(c('red','grey'),c('Yes', 'No'))) +# shows how to decide the colour
+   geom_vline(xintercept=c(log2(fc_threshold),log2(fc_threshold)*-1), linetype = "dashed") # adds the vertical indicating our chosen fold change threshold
+}
+volcano_plot(results, fc_threshold,fdr_threshold,5)
+```
+
+
+## Differential gene set analysis
+
+```{r}
+# load the .gmt files for DE set analysis
+kegg_data <- getGmt('c2.cp.kegg.v7.5.1.symbols.gmt')
+gomf_data <- getGmt('c5.go.mf.v7.5.1.symbols.gmt')
+gobp_data <- getGmt('c5.go.bp.v7.5.1.symbols.gmt')
+gocc_data <- getGmt('c5.go.cc.v7.5.1.symbols.gmt')
+reactome_data <- getGmt('c2.cp.reactome.v7.5.1.symbols.gmt')
+```
+
+```{r}
+# convert each data set into a list of lists
+kegg<-geneIds(kegg_data)
+gomf<-geneIds(gomf_data)
+gobp<-geneIds(gobp_data)
+gocc<-geneIds(gocc_data)
+reactome<-geneIds(reactome_data)
+```
+
+```{r}
+### run fry
+# KEGG pathway
+setres_kegg <-fry(
+  y=dgGlm, 
+  index=ids2indices(kegg, rownames(dgGlm)),
+  design=design,
+  contrast=contrast_matrix,
+  )
+setres_kegg <- setres_kegg[order(setres_kegg$FDR),]
+
+#run GO_cc
+setres_cc <-fry(
+  y=dgGlm, 
+  index=ids2indices(gocc, rownames(dgGlm)),
+  design=design,
+  contrast=contrast_matrix,
+  )
+setres_cc <- setres_cc[order(setres_cc$FDR),]
+
+#run GO_mf
+setres_mf <-fry(
+  y=dgGlm, 
+  index=ids2indices(gomf, rownames(dgGlm)),
+  design=design,
+  contrast=contrast_matrix,
+  )
+setres_mf <- setres_mf[order(setres_mf$FDR),]
+
+# run GO_bp
+setres_bp <-fry(
+  y=dgGlm, 
+  index=ids2indices(gobp, rownames(dgGlm)),
+  design=design,
+  contrast=contrast_matrix,
+  )
+setres_bp <- setres_bp[order(setres_bp$FDR),]
+
+# run reactome pathway
+setres_reactome <-fry(
+  y=dgGlm, 
+  index=ids2indices(reactome, rownames(dgGlm)),
+  design=design,
+  contrast=contrast_matrix,
+  )
+setres_reactome <- setres_reactome[order(setres_reactome$FDR),]
+```
+
+an example: KEGG_SMALL_CELL_LUNG_CANCER 
+```{r}
+setres_kegg['KEGG_SMALL_CELL_LUNG_CANCER',] 
+genes<-kegg[['KEGG_SMALL_CELL_LUNG_CANCER']] # get the names of  genes in the set
+genes
+```
+
+```{r}
+# plot the heatmap of the DE set genes
+kegg_plotmatrix <- cpm(dgList,log=TRUE)[genes,]
+ pheatmap(
+    plotmatrix, 
+    show_rownames = TRUE,
+    show_colnames = FALSE,
+    border_color = NA,
+    legend = TRUE, 
+    cluster_cols = FALSE,
+    cluster_rows = TRUE,
+    scale = 'row',
+    color = colorRampPalette(rev(RColorBrewer::brewer.pal(n = 7, name = "RdYlBu")))(2),
+  )
+```
+
+## shiny data
+```{r}
+library(tximport)
+library(rtracklayer)
+library(edgeR)
+library(pheatmap)
+library(ggplot2)
+library(PCAtools)
+library(GSEABase)
+```
+
+```{r load data}
+sample_detail<-read.csv("sample_data.csv",header=TRUE,row.names = 1)
+counts<-read.csv("counts.csv",header = TRUE,row.names = 1)
+controls_ids<-read.table("control_ids.txt",header=T)
+
+# load the .gmt files
+kegg_data <- getGmt('c2.cp.kegg.v7.5.1.symbols.gmt')
+gomf_data <- getGmt('c5.go.mf.v7.5.1.symbols.gmt')
+gobp_data <- getGmt('c5.go.bp.v7.5.1.symbols.gmt')
+gocc_data <- getGmt('c5.go.cc.v7.5.1.symbols.gmt')
+reactome_data <- getGmt('c2.cp.reactome.v7.5.1.symbols.gmt')
+
+# convert each data set into a list of lists
+KEGG_Pathways<-geneIds(kegg_data)
+GO_Molecular_Functions<-geneIds(gomf_data)
+GO_Biological_Processes<-geneIds(gobp_data)
+GO_Cellular_Components<-geneIds(gocc_data)
+Reactome<-geneIds(reactome_data)
+
+```
+
+```{r function1}
+do_de_analysis <- function(count_results,sample_info,sample_group,blocking_vars = c(), contrast_name,count_threshold = 4, outliers = c('none'), print = TRUE ){
+  fc_threshold <-2     # Fold change threshold
+  fdr_threshold <-0.05 # FDR threshold
+  
+  sample_info<-sample_info[rownames(sample_info) %in%       colnames(count_results),] #  # 1 remove samples for which we don't have counts.
+  counts <-count_results[, rownames(sample_info)]   #  only use the samples described in the sample_info data frame. 
+  
+  dgList <- DGEList(counts = counts, 
+                    samples = sample_info,
+                    group = sample_group)  # 2. create the dgList object
+  
+   dgList <- sumTechReps(dgList, ID=dgList$samples$ID)  # 3.  merge the technical replicates. This can be omitted if there are no technical replicates.
+ dgList <- dgList[, which(!rownames(dgList$samples) %in% outliers)]  # 4. Removes any outlying samples specified in list `outliers`. This can be omitted if there are no outliers
+
+ controls<-rep("disease",length(dgList$samples[,1]))
+ controls[which(row.names(dgList$samples) %in% controls_ids[,1])]<-"control"
+ dgList$samples[['control']]<-controls
+
+  keep<-filterByExpr(dgList,
+                     min.count=count_threshold,
+                     group=dgList$sample$group,
+                     min.total.count=10) # 5. Filter lowly expressed genes
+
+   dgList <- dgList[keep,]
+   dgList<- calcNormFactors(dgList) # 6. Normalise the counts
+  # formula <- paste(c('~0', c(group_var, blocking_vars)), collapse = ' + ' )  # 7.  create the formula for he experimental design
+  # design <- model.matrix(as.formula(formula), data = dgList$samples) # 8.  create the experimental design
+  design <- model.matrix(~0 + group, data = dgList$samples)
+  dgGlm <- estimateDisp(dgList[,rownames(design)], design, robust = TRUE) # 9.  estimate the dispersion
+  fit <- glmQLFit(dgGlm, design, robust = TRUE)  # 10.  fit the data to the design
+ contrast_matrix <- makeContrasts(contrasts =contrast_name, levels=design) # 11. create the contrast
+ de <- glmQLFTest(fit, contrast=contrast_matrix)    # 12. test for differentially expressed genes
+ results <- topTags(de, n=nrow(dgList) )$table   # 13.  extract the results table
+ de_genes <- rownames(results)[abs(results$logFC) >= log2(fc_threshold) &
+                                 results$FDR <= fdr_threshold ]  #  14. extract genes passing FDR and fold change thresholds.
+
+ if (print){
+     outliers<-paste(outliers,collapse=', ')
+   print(paste(length(de_genes), 'genes are differentially expressed for contrast',
+   contrast_name, 'at a fold change of at least', fc_threshold,
+   'and a maximum FDR of', fdr_threshold,  'when using a count threshold of',count_threshold,
+   ' and removing outliers in list: ', outliers))
+ }
+
+ list(
+   dgGlm = dgGlm,
+   dgList = dgList,
+   fit =fit,
+   results = results,
+   diffexp_genes = de_genes,
+   contrast_matrix = contrast_matrix,
+   design = design,
+   de = de
+ )
+}
+```
+
+```{r function2}
+# define a function for fry analysis
+do_fry_analysis<-function(x,y,i,j){
+  fry_results<-fry(
+  y=x, 
+  index=ids2indices(y, rownames(x)),
+  design=i,
+  contrast=j,
+  )
+fry_results <- fry_results[order(fry_results$FDR),]
+fry_results <- fry_results[1:50,]
+return(fry_results)  
+}
+```
+
+```{r test1}
+for (i in colnames(sample_detail)[2:9]) {
+  do.call("=",list(paste0(i), do_de_analysis(count_results=counts,
+                                   sample_info =sample_detail,
+                                   sample_detail[,i],
+                                   contrast_name = paste0('group',min(sample_detail[,i]),'-','group',max(sample_detail[,i])),
+                                   count_threshold = 2)))
+}
+```
+
+```{r}
+sample_group<-list(nafld_activity_score_hepatocyte_ballooning,
+                   saf_inflammation_score,
+                   kleiner_brunt_steatosis_score,
+                   saf_steatosis,
+                   nafld_activity_score_lobular_inflammation,
+                   saf_balloon_score,
+                   modified_ishak_score,
+                   nash.crn_kleiner_fibrosis_stage)
+
+pathway_list<-list(KEGG_Pathways,
+                   GO_Biological_Processes,
+                   GO_Cellular_Components,
+                   GO_Molecular_Functions,
+                   Reactome)
+
+result_name <- c('nafld_activity_score_hepatocyte_ballooning',
+                   'saf_inflammation_score',
+                   'kleiner_brunt_steatosis_score',
+                   'saf_steatosis',
+                   'nafld_activity_score_lobular_inflammation',
+                   'saf_balloon_score',
+                   'modified_ishak_score',
+                   'nash.crn_kleiner_fibrosis_stage')
+
+pathway_name <- c('KEGG_Pathways',
+                  'GO_Biological_Processes',
+                  'GO_Cellular_Components',
+                  'GO_Molecular_Functions',
+                  'Reactome')
+
+for (i in 1:length(sample_group)) {
+  for (j in 1:length(pathway_list)) {
+    do.call("=",list(paste0(result_name[i],'_',pathway_name[j]),
+                     do_fry_analysis(sample_group[[i]]$dgGlm,pathway_list[[j]],
+                                     sample_group[[i]]$design,
+                                     sample_group[[i]]$contrast_matrix)))
+  }
+}
+
+```
+
+
+
